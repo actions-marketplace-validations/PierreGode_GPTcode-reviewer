@@ -1,9 +1,9 @@
 import { readFileSync } from "fs";
 import * as core from "@actions/core";
-import { Configuration, OpenAIApi } from "openai";
+import OpenAI from "openai";
 import { Octokit } from "@octokit/rest";
 import parseDiff, { Chunk, File } from "parse-diff";
-import minimatch from "minimatch";
+import * as minimatch from "minimatch";
 
 const GITHUB_TOKEN: string = core.getInput("GITHUB_TOKEN");
 const OPENAI_API_KEY: string = core.getInput("OPENAI_API_KEY");
@@ -15,11 +15,9 @@ const RESPONSE_TOKENS = 1024;
 
 const octokit = new Octokit({ auth: GITHUB_TOKEN });
 
-const configuration = new Configuration({
+const openai = new OpenAI({
   apiKey: OPENAI_API_KEY,
 });
-
-const openai = new OpenAIApi(configuration);
 
 interface PRDetails {
   owner: string;
@@ -85,67 +83,85 @@ async function analyzeCode(
 
   if (aiResponse) {
     const newComments = createComments(changedFiles, aiResponse);
-
     if (newComments) {
       comments.push(...newComments);
     }
   }
-
   return comments;
 }
 
 function createPrompt(changedFiles: File[], prDetails: PRDetails): string {
   const problemOutline = `Your task is to review pull requests (PR). Instructions:
-- Provide the response in following JSON format:  [{"file": <file name>,  "lineNumber":  <line_number>, "reviewComment": "<review comment>"}]
+- Provide the response in the following JSON format: [{"file": <file name>, "lineNumber": <line_number>, "reviewComment": "<review comment>"}]
 - DO NOT give positive comments or compliments.
 - DO NOT give advice on renaming variable names or writing more descriptive variables.
-- Provide comments and suggestions ONLY if there is something to improve, otherwise return an empty array.
+- Provide comments and suggestions ONLY if there is something to improve in the diff, otherwise return an empty array.
 - Provide at most ${REVIEW_MAX_COMMENTS} comments. It's up to you how to decide which comments to include.
 - Write the comment in GitHub Markdown format.
-- Check for math or logic errors in code.
-- Use the given description only for the overall context and only comment the code.
-${
-  REVIEW_PROJECT_CONTEXT
-    ? `- Additional context regarding this PR's project: ${REVIEW_PROJECT_CONTEXT}`
-    : ""
-}
+- Use the given description only for the overall context and only comment on the code changes.
+${REVIEW_PROJECT_CONTEXT ? `- Additional context regarding this PR's project: ${REVIEW_PROJECT_CONTEXT}` : ""}
 - IMPORTANT: NEVER suggest adding comments to the code.
+- IMPORTANT: NEVER comment on comment rows unless they pose any issues to the code.
 - IMPORTANT: Evaluate the entire diff in the PR before adding any comments.
+- IMPORTANT: The following full file contexts are provided solely to give you a complete understanding of the codebase. You MUST ONLY comment on the changed rows indicated in the diff and ignore the rest of the file content.
 
 Pull request title: ${prDetails.title}
 Pull request description:
-
 ---
 ${prDetails.description}
 ---
 
-TAKE A DEEP BREATH AND WORK ON THIS THIS PROBLEM STEP-BY-STEP.
+TAKE A DEEP BREATH AND WORK ON THIS PROBLEM STEP-BY-STEP.
 `;
 
-  const diffChunksPrompt = new Array();
-
+  const diffChunksPrompt: string[] = [];
   for (const file of changedFiles) {
-    if (file.to === "/dev/null") continue; // Ignore deleted files
+    if (!file.to || file.to === "/dev/null") continue; // Ignore deleted or undefined files
     for (const chunk of file.chunks) {
       diffChunksPrompt.push(createPromptForDiffChunk(file, chunk));
     }
   }
 
-  return `${problemOutline}\n ${diffChunksPrompt.join("\n")}`;
+  const fileContextsPrompt: string[] = [];
+  for (const file of changedFiles) {
+    if (!file.to || file.to === "/dev/null") continue; // Ignore deleted or undefined files
+    try {
+      const fileContent = readFileSync(file.to, "utf8");
+      fileContextsPrompt.push(`\nFull file context for "${file.to}":\n\`\`\`plaintext\n${fileContent}\n\`\`\``);
+    } catch (error) {
+      console.error(`Failed to read file ${file.to}:`, error);
+    }
+  }
+
+  return `${problemOutline}\n${diffChunksPrompt.join("\n")}\n${fileContextsPrompt.join("\n")}`;
 }
 
 function createPromptForDiffChunk(file: File, chunk: Chunk): string {
-  return `\n
-  Review the following code diff in the file "${file.to}". Git diff to review:
+  // Include the chunk header (e.g. "@@ -1,4 +1,4 @@") if present
+  const header = chunk.content ? chunk.content.trim() : "";
+  // Filter out deleted rows and only show added/changed rows
+  const changesStr = chunk.changes
+    .filter((c) => {
+      const change = c as any;
+      return change.type !== "del";
+    })
+    .map((c) => {
+      const change = c as any;
+      let prefix = " ";
+      if (change.type === "add") {
+        prefix = "+";
+      }
+      return `${prefix} ${change.content}`;
+    })
+    .join("\n");
 
-  \`\`\`diff
-  ${chunk.content}
-  ${chunk.changes
-    // @ts-expect-error - ln and ln2 exists where needed
-    .map((c) => `${c.ln ? c.ln : c.ln2} ${c.content}`)
-    .join("\n")}
-  \`\`\`
-  `;
+  return `\nReview the following code diff in the file but ignore + at the beginning of line as it just points out that this is an added line and not deleted. "${file.to}":
+  
+\`\`\`diff
+${header}
+${changesStr}
+\`\`\`
+`;
 }
 
 async function getAIResponse(
@@ -161,7 +177,7 @@ async function getAIResponse(
   };
 
   try {
-    const response = await openai.createChatCompletion({
+    const response = await openai.chat.completions.create({
       ...queryConfig,
       messages: [
         {
@@ -171,21 +187,18 @@ async function getAIResponse(
       ],
     });
 
-    const res = response.data.choices[0].message?.content?.trim() || "[]";
+    const res = response.choices[0].message?.content?.trim() || "[]";
     return JSON.parse(res);
   } catch (error: any) {
     console.error("Error Message:", error?.message || error);
-
     if (error?.response) {
       console.error("Response Data:", error.response.data);
       console.error("Response Status:", error.response.status);
       console.error("Response Headers:", error.response.headers);
     }
-
     if (error?.config) {
       console.error("Config:", error.config);
     }
-
     return null;
   }
 }
@@ -197,14 +210,13 @@ function createComments(
   return aiResponses
     .flatMap((aiResponse) => {
       const file = changedFiles.find((file) => file.to === aiResponse.file);
-
       return {
         body: aiResponse.reviewComment,
         path: file?.to ?? "",
         line: Number(aiResponse.lineNumber),
       };
     })
-    .filter((comments) => comments.path !== "");
+    .filter((comment) => comment.path !== "");
 }
 
 async function createReviewComment(
@@ -230,25 +242,17 @@ async function main() {
   );
 
   if (eventData.action === "opened") {
-    diff = await getDiff(
-      prDetails.owner,
-      prDetails.repo,
-      prDetails.pull_number
-    );
+    diff = await getDiff(prDetails.owner, prDetails.repo, prDetails.pull_number);
   } else if (eventData.action === "synchronize") {
     const newBaseSha = eventData.before;
     const newHeadSha = eventData.after;
-
     const response = await octokit.repos.compareCommits({
-      headers: {
-        accept: "application/vnd.github.v3.diff",
-      },
+      headers: { accept: "application/vnd.github.v3.diff" },
       owner: prDetails.owner,
       repo: prDetails.repo,
       base: newBaseSha,
       head: newHeadSha,
     });
-
     diff = String(response.data);
   } else {
     console.log("Unsupported event:", process.env.GITHUB_EVENT_NAME);
@@ -269,18 +273,13 @@ async function main() {
 
   const filteredDiff = changedFiles.filter((file) => {
     return !excludePatterns.some((pattern) =>
-      minimatch(file.to ?? "", pattern)
+      minimatch.minimatch(file.to ?? "", pattern)
     );
   });
 
   const comments = await analyzeCode(filteredDiff, prDetails);
   if (comments.length > 0) {
-    await createReviewComment(
-      prDetails.owner,
-      prDetails.repo,
-      prDetails.pull_number,
-      comments
-    );
+    await createReviewComment(prDetails.owner, prDetails.repo, prDetails.pull_number, comments);
   }
 }
 
